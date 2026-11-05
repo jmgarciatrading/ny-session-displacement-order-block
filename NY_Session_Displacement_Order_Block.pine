@@ -1,0 +1,188 @@
+//@version=6
+indicator("NY Window Displacement Order Block", overlay = true,
+     max_boxes_count = 1, max_labels_count = 1)
+
+// Finds the opposing candle immediately before a decisive displacement candle.
+// One structural-origin order block remains on the chart.
+
+string GRP_WINDOW = "New York Time Window"
+int startHour = input.int(9, "Start Hour", minval = 0, maxval = 23,
+     group = GRP_WINDOW, inline = "start")
+int startMinute = input.int(30, "Minute", minval = 0, maxval = 59,
+     group = GRP_WINDOW, inline = "start")
+int endHour = input.int(11, "End Hour", minval = 0, maxval = 23,
+     group = GRP_WINDOW, inline = "end")
+int endMinute = input.int(0, "Minute", minval = 0, maxval = 59,
+     group = GRP_WINDOW, inline = "end")
+
+string GRP_COLORS = "Colors"
+color bullishColor = input.color(color.new(color.rgb(33, 150, 243), 80),
+     "Bullish Order Block", group = GRP_COLORS)
+color bearishColor = input.color(color.new(color.rgb(244, 67, 54), 80),
+     "Bearish Order Block", group = GRP_COLORS)
+
+string GRP_SWING = "Prior Swing Marker"
+int swingLength = input.int(2, "Swing Strength", minval = 1, maxval = 20,
+     group = GRP_SWING,
+     tooltip = "Bars required on each side of a confirmed swing. The OB candle itself is always excluded.")
+
+const string NY_TIMEZONE = "America/New_York"
+const int DIR_BULL = 1
+const int DIR_BEAR = -1
+
+f_isWithinNyWindow(int barsAgo) =>
+    int barMinutes = hour(time[barsAgo], NY_TIMEZONE) * 60 + minute(time[barsAgo], NY_TIMEZONE)
+    int startMinutes = startHour * 60 + startMinute
+    int endMinutes = endHour * 60 + endMinute
+    startMinutes < endMinutes ?
+         barMinutes >= startMinutes and barMinutes < endMinutes :
+         startMinutes > endMinutes ?
+         barMinutes >= startMinutes or barMinutes < endMinutes : true
+
+f_nyDateKey(int timestamp) =>
+    year(timestamp, NY_TIMEZONE) * 10000 + month(timestamp, NY_TIMEZONE) * 100 +
+         dayofmonth(timestamp, NY_TIMEZONE)
+
+// The active day is the New York date of the chart's latest available bar.
+// On Monday, for example, Friday's order block is ineligible and is removed.
+int activeChartNyDateKey = f_nyDateKey(last_bar_time)
+
+f_isActiveChartDay(int barsAgo) =>
+    f_nyDateKey(time[barsAgo]) == activeChartNyDateKey
+
+// Keep the two newest confirmed pivots of each type. Two are necessary because
+// the newest pivot can be the OB candle itself, which must be skipped.
+float confirmedSwingHigh = ta.pivothigh(high, swingLength, swingLength)
+float confirmedSwingLow = ta.pivotlow(low, swingLength, swingLength)
+
+var int latestSwingHighBar = na
+var float latestSwingHighPrice = na
+var int latestSwingHighDateKey = na
+var int previousSwingHighBar = na
+var float previousSwingHighPrice = na
+var int previousSwingHighDateKey = na
+
+var int latestSwingLowBar = na
+var float latestSwingLowPrice = na
+var int latestSwingLowDateKey = na
+var int previousSwingLowBar = na
+var float previousSwingLowPrice = na
+var int previousSwingLowDateKey = na
+
+if not na(confirmedSwingHigh)
+    previousSwingHighBar := latestSwingHighBar
+    previousSwingHighPrice := latestSwingHighPrice
+    previousSwingHighDateKey := latestSwingHighDateKey
+    latestSwingHighBar := bar_index - swingLength
+    latestSwingHighPrice := confirmedSwingHigh
+    latestSwingHighDateKey := f_nyDateKey(time[swingLength])
+
+if not na(confirmedSwingLow)
+    previousSwingLowBar := latestSwingLowBar
+    previousSwingLowPrice := latestSwingLowPrice
+    previousSwingLowDateKey := latestSwingLowDateKey
+    latestSwingLowBar := bar_index - swingLength
+    latestSwingLowPrice := confirmedSwingLow
+    latestSwingLowDateKey := f_nyDateKey(time[swingLength])
+
+// Displacement is one directional candle closing beyond the opposing anchor's
+// full range. The anchor is always the immediately preceding candle.
+bool bullishDisplacement = close > open and close > high[1]
+bool bearishDisplacement = close < open and close < low[1]
+
+bool bullishAnchor = close[1] < open[1]
+bool bearishAnchor = close[1] > open[1]
+bool patternInsideWindow = f_isWithinNyWindow(1) and f_isWithinNyWindow(0)
+bool patternInsideActiveDay = f_isActiveChartDay(1) and f_isActiveChartDay(0)
+
+bool bullishOrderBlock = barstate.isconfirmed and patternInsideActiveDay and
+     patternInsideWindow and bullishAnchor and bullishDisplacement
+bool bearishOrderBlock = barstate.isconfirmed and patternInsideActiveDay and
+     patternInsideWindow and bearishAnchor and bearishDisplacement
+
+var box latestOrderBlock = na
+var label latestSwingMarker = na
+var int latestOrderBlockDateKey = na
+var int latestOrderBlockDirection = 0
+var int latestOrderBlockCreationBar = na
+var float latestOrderBlockTop = na
+var float latestOrderBlockBottom = na
+var bool latestOrderBlockMitigated = false
+
+// Clear the stale drawing immediately when the chart advances to a new NY day.
+if not na(latestOrderBlock) and latestOrderBlockDateKey != activeChartNyDateKey
+    box.delete(latestOrderBlock)
+    if not na(latestSwingMarker)
+        label.delete(latestSwingMarker)
+    latestOrderBlock := na
+    latestSwingMarker := na
+    latestOrderBlockDateKey := na
+    latestOrderBlockDirection := 0
+    latestOrderBlockCreationBar := na
+    latestOrderBlockTop := na
+    latestOrderBlockBottom := na
+    latestOrderBlockMitigated := false
+
+// A touch after formation mitigates the active origin. Until then, later
+// same-direction continuation blocks cannot replace it.
+if not na(latestOrderBlock) and not latestOrderBlockMitigated and
+     bar_index > latestOrderBlockCreationBar and
+     high >= latestOrderBlockBottom and low <= latestOrderBlockTop
+    latestOrderBlockMitigated := true
+
+if bullishOrderBlock or bearishOrderBlock
+    int candidateDirection = bullishOrderBlock ? DIR_BULL : DIR_BEAR
+    bool directionChanged = candidateDirection != latestOrderBlockDirection
+    bool canReplace = na(latestOrderBlock) or latestOrderBlockMitigated or directionChanged
+
+    if canReplace
+        if not na(latestOrderBlock)
+            box.delete(latestOrderBlock)
+        if not na(latestSwingMarker)
+            label.delete(latestSwingMarker)
+            latestSwingMarker := na
+
+        color orderBlockColor = bullishOrderBlock ? bullishColor : bearishColor
+        latestOrderBlock := box.new(left = bar_index - 1, top = high[1],
+             right = bar_index + 1, bottom = low[1], xloc = xloc.bar_index,
+             extend = extend.right, border_color = orderBlockColor,
+             bgcolor = orderBlockColor)
+        latestOrderBlockDateKey := activeChartNyDateKey
+        latestOrderBlockDirection := candidateDirection
+        latestOrderBlockCreationBar := bar_index
+        latestOrderBlockTop := high[1]
+        latestOrderBlockBottom := low[1]
+        latestOrderBlockMitigated := false
+
+        // Select the closest confirmed directional swing strictly before the
+        // OB. If the newest pivot is the OB itself, fall back to the prior one.
+        int orderBlockBar = bar_index - 1
+        int priorSwingBar = na
+        float priorSwingPrice = na
+        if candidateDirection == DIR_BEAR
+            if not na(latestSwingHighBar) and latestSwingHighBar < orderBlockBar and
+                 latestSwingHighDateKey == activeChartNyDateKey
+                priorSwingBar := latestSwingHighBar
+                priorSwingPrice := latestSwingHighPrice
+            else if not na(previousSwingHighBar) and previousSwingHighBar < orderBlockBar and
+                 previousSwingHighDateKey == activeChartNyDateKey
+                priorSwingBar := previousSwingHighBar
+                priorSwingPrice := previousSwingHighPrice
+        else
+            if not na(latestSwingLowBar) and latestSwingLowBar < orderBlockBar and
+                 latestSwingLowDateKey == activeChartNyDateKey
+                priorSwingBar := latestSwingLowBar
+                priorSwingPrice := latestSwingLowPrice
+            else if not na(previousSwingLowBar) and previousSwingLowBar < orderBlockBar and
+                 previousSwingLowDateKey == activeChartNyDateKey
+                priorSwingBar := previousSwingLowBar
+                priorSwingPrice := previousSwingLowPrice
+
+        if not na(priorSwingBar)
+            float markerY = candidateDirection == DIR_BEAR ?
+                 priorSwingPrice + syminfo.mintick * 4 : priorSwingPrice - syminfo.mintick * 4
+            markerStyle = candidateDirection == DIR_BEAR ?
+                 label.style_arrowdown : label.style_arrowup
+            latestSwingMarker := label.new(priorSwingBar, markerY, "",
+                 xloc = xloc.bar_index, yloc = yloc.price, style = markerStyle,
+                 color = color.new(orderBlockColor, 0), size = size.tiny)
